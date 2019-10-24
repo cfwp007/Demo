@@ -1,0 +1,82 @@
+public class CrashHandler implements Thread.UncaughtExceptionHandler {
+
+
+    private Context mContext;
+
+    private static CrashHandler instance = new CrashHandler();
+
+    private CrashHandler() {//构造方法私有
+    }
+    private static Boolean LOG_SWITCH = true; // 日志文件总开关
+
+    public static CrashHandler getInstance() {
+        return instance;
+    }
+
+    public void init(Context context) {
+        this.mContext = context;
+        Thread.setDefaultUncaughtExceptionHandler(instance);//设置该CrashHandler为系统默认的
+    }
+
+    @Override
+    public void uncaughtException(Thread thread, Throwable ex) {
+
+        saveInfoToFile(collectCrashInfo(ex));//保存错误信息
+
+    } private String collectCrashInfo(Throwable ex) {
+        if (ex == null) return "";
+
+        Writer writer = new StringWriter();
+        PrintWriter printWriter = new PrintWriter(writer);
+        ex.printStackTrace(printWriter);
+        Throwable throwable = ex.getCause();
+        while (throwable != null) {
+            throwable.printStackTrace(printWriter);
+            throwable = throwable.getCause();//逐级获取错误信息
+        }
+        String crashInfo = writer.toString();
+        LogUtils.i("bqt", "【错误信息】" + crashInfo);
+        printWriter.close();
+        return crashInfo;
+    }
+
+    private void saveInfoToFile(String crashInfo) {
+//    String LOG_PATH = Environment.getExternalStorageDirectory().getAbsolutePath() + "/crashLog/";
+        try {
+            File file;
+            String date = new SimpleDateFormat("yyyy.MM.dd_HH_mm_ss", Locale.getDefault()).format(new Date());
+            String fileName =  "crash_" + date + ".txt";
+            // 判断是否有SD卡或者外部存储器
+            if (Environment.getExternalStorageState().equals(Environment.MEDIA_MOUNTED)) {
+                // 有SD卡则使用SD - PS:没SD卡但是有外部存储器，会使用外部存储器
+                // SD\Android\data\包名\files\Log\TracrashLogs.txt
+                file = new File(mContext.getExternalFilesDir("crashLog").getPath() + "/" );
+            } else {
+                // 没有SD卡或者外部存储器，使用内部存储器
+                // \data\data\包名\files\Log\TracrashLogs.txt
+                file = new File(mContext.getFilesDir().getPath() + "/crashLog/");
+            }
+            // 若目录不存在则创建目录
+            if (!file.exists()) {
+                file.mkdir();
+            } //java.io.FileNotFoundException: crash_2019.10.24_15_53_32.txt (Read-only file system)
+           //  /storage/emulated/0/Android/data/com.wwc2.trafficmove/files/crashLog/crash_日期.txt
+            File logFile = new File(file.getPath() + "/" + fileName);
+            if (!logFile.exists()) {
+                try {
+                    logFile.createNewFile();
+                } catch (Exception e) {
+                    LogUtils.e("Create log file failure !!! " + e.toString());
+                }
+            }
+
+
+            FileWriter writer = new FileWriter(logFile.getPath());//如果保存失败，很可能是没有写SD卡权限
+            writer.write(crashInfo);
+            writer.close();
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
+    }
+
+}
