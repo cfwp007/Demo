@@ -1,0 +1,1673 @@
+package com.wwc2.dvr.ui.record;
+
+import android.content.Context;
+import android.graphics.ImageFormat;
+import android.hardware.Camera;
+import android.net.Uri;
+import android.os.AsyncTask;
+import android.os.Handler;
+import android.os.HandlerThread;
+import android.os.Message;
+import android.os.Process;
+import android.os.SystemProperties;
+import android.renderscript.ScriptGroup;
+import android.text.TextUtils;
+import android.view.SurfaceView;
+import android.view.View;
+import com.wwc2.avin_interface.AvinDefine;
+import com.wwc2.common_interface.utils.StorageDevice;
+import com.wwc2.corelib.db.Packet;
+import com.wwc2.corelib.db.Result;
+import com.wwc2.corelib.message.MessageDefine;
+import com.wwc2.corelib.utils.log.LogUtils;
+import com.wwc2.corelib.utils.shell.ShellUtils;
+import com.wwc2.corelib.utils.timer.TimerUtils;
+import com.wwc2.dvr.DvrApplication;
+import com.wwc2.dvr.R;
+import com.wwc2.dvr.RecordService;
+import com.wwc2.dvr.data.Config;
+import com.wwc2.dvr.data.ConstantsData;
+import com.wwc2.dvr.data.RecordData;
+import com.wwc2.dvr.data.Stereo;
+import com.wwc2.dvr.utils.FileUtils;
+import com.wwc2.dvr.utils.SPUtils;
+import com.wwc2.dvr.utils.ThreadpoolUtil;
+import com.wwc2.dvr.utils.ToastUtils;
+import com.wwc2.dvr.utils.Utils;
+
+import java.io.BufferedReader;
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.FileOutputStream;
+import java.io.IOException;
+import java.io.InputStreamReader;
+import java.lang.ref.WeakReference;
+import java.util.concurrent.locks.Lock;
+import java.util.concurrent.locks.ReentrantLock;
+
+
+public final class CameraHandlerThread extends HandlerThread {
+    public static final int MSG_RECORD_STATUS = 8;
+    private static final String TAG = CameraHandlerThread.class.getSimpleName();
+    //**********************************************************************
+    private static final int MSG_OPEN = 0;
+    private static final int MSG_CLOSE = 1;
+    private static final int MSG_PREVIEW_STOP = 3;
+    private static final int MSG_CAPTURE_STILL = 4;
+    private static final int MSG_CAPTURE_START = 5;
+    private static final int MSG_CAPTURE_STOP = 6;
+    //    private static final int MSG_AUTO_RECORD = 9;
+    private static final String TAG_THREAD = "CameraThread";
+    /**
+     * the camera open path.
+     */
+    private static final String CAMERA_OPEN_PATH = "/custom/CameraOpen";
+//    private static final String CAMERA_PARAMS_NODE = "/sys/class/gpiodrv/gpio_ctrl/cam_params";
+//    private static final String CAMERA_TYPE_NODE = "/sys/class/gpiodrv/gpio_ctrl/cam_mode";
+    private static final String CAMERA_MIRROR = "/sys/class/gpiodrv/gpio_ctrl/cam_mirror";
+    private static final String CAMERA_SIGNAL_NODE = "/sys/class/gpiodrv/gpio_ctrl/sig_check";
+//    private static final String CAMERA_FRAMERATE_NODE = "/sys/class/gpiodrv/gpio_ctrl/cam_rate";
+public volatile static int PREVIEW_WIDTH, PREVIEW_HEIGHT;
+    /**
+     * 锁
+     */
+    private static Lock mLock = new ReentrantLock();
+    private final Object mSync = new Object();
+    private final int CHECK_PERIOD = 50;
+    //前置
+    private final SurfaceView frontCView;
+    //后置
+    private final SurfaceView backCView;
+    /**
+     * 上下文
+     */
+    protected Context mContext = null;
+    /**
+     * 倒车表面对象
+     */
+    private Handler mHandler; /**
+     * for accessing camera
+     */
+    private Camera mCameraBack;
+    private Camera mCameraFront;
+
+    public boolean isBackOpen() {
+        return (mCameraBack != null);
+    }
+
+    public boolean isFrontOpen() {
+        return (mCameraFront != null);
+    } 
+    //没信号
+    private static final int MSG_NO_SIGNAL = 100;
+    //有信号
+    private static final int MSG_NEWSIGNAL = 99;
+    //完成拍照
+    private static final int MSG_PHOTO_FINISH = 101;
+    //拍照失败
+    private static final int MSG_PHOTO_FAIL = 102;
+    //拍照异常
+    private static final int MSG_PHOTO_ERR = 103;
+    //显示后摄
+    private static final int MSG_BACK_SHOW = 104;
+    //显示前摄
+    private static final int MSG_FRONT_SHOW = 105;
+     /**
+     * 查询摄像头开关定时器ID
+     */
+    private int mQueryCameraOpenTimerId = 0;
+    private int checkTimerID = 0;
+    /**
+     * mHandler object.
+     */
+    private int lastSignal = 0;
+    private int newSignal = 0;
+    private int noSignalCount = 0;/**
+     * 单个视频文件时长
+     */
+    private int recordDuration = 60 * 1000;
+    private boolean allowTakePicture = true;
+
+    private String NEW_RECORD_ACTION = Config.RECORD_UNKONW;
+    private String PLATFORM;
+
+    //主线程handler
+    private Handler mainHandler;
+    private int cameraCheckState;
+
+    private boolean accStatus = false;
+    /*** CAMERA是否打开
+     */
+    private Result mCameraOpen = new Result(AvinDefine.CameraOpen.INIT, new Result.ResultListener() {
+        @Override
+        public void onResult(int oldVal, int newVal) {
+            LogUtils.d(TAG, "camera, mCameraOpen, oldVal = " + AvinDefine.CameraOpen.toString(oldVal) + ", newVal" +
+                    " = "
+                    + (AvinDefine.CameraOpen.toString(newVal)
+                    == null ? newVal : AvinDefine.CameraOpen.toString(newVal)));
+                if(newVal == AvinDefine.CameraOpen.CLOSE_OVER){ if(IS_REBOOT){
+                        open();
+                    }
+                }
+                if(newVal == Config.PREVIEW_OVER){
+                    checkStatus();
+                }
+ //收到OPEN_OVER
+            if (AvinDefine.CameraOpen.open(newVal)) {
+                LogUtils.d(TAG, "Camera open success, 开始预览...");
+                startSignalWatch();
+
+            }
+
+            update_camera_open(AvinDefine.CameraOpen.can_open(newVal));
+        }
+    });
+private void checkStatus(){
+        LogUtils.d(TAG, "...同步检测状态...");
+
+        String camera = mContext.getContentResolver().getType(RecordService.uri_camera);
+        boolean isReversing = camera.equals("true") ? true : false;
+        if(isReversing){
+            LogUtils.d(TAG, "...启动检测倒车...切换...");
+            mainHandler.sendMessage(mainHandler.obtainMessage(Config.CAMERA_REVERSING, true));
+        }//必须处于没有录制的情况
+        if(!isRecording()){
+            //如果开关打开或者上次正在录制，则恢复录制状态
+            LogUtils.d("WPTAG------------>"+SPUtils.getAutoRecord(mContext) +  "    rebootRecording--->" + rebootRecording);
+            if (SPUtils.getAutoRecord(mContext) || rebootRecording) {
+                LogUtils.d(TAG, "...开启..录像...");
+                mainHandler.sendMessage(mainHandler.obtainMessage(Config.START_RECORDING, true));
+            }
+        }else {
+            LogUtils.d(TAG, "...checkStatus...当前正在录制？？？...");
+            sendRecordValue();
+        }
+    }public CameraHandlerThread(Context context, String name, SurfaceView f_View, SurfaceView b_View,
+                               int cameraCheckState, String platform) {
+        super(name, Process.THREAD_PRIORITY_URGENT_DISPLAY);
+        mContext = context;
+        LogUtils.d(TAG, "Constructor:");
+        this.frontCView = f_View;
+        this.backCView = b_View;
+        this.cameraCheckState = cameraCheckState;
+
+        PLATFORM = platform;
+    } public void setCurAccStatus(boolean accStatus) {
+        this.accStatus = accStatus;
+    }
+    @Override
+    protected void onLooperPrepared() {
+        super.onLooperPrepared();
+        synchronized (mSync) {
+            if (mHandler == null) {
+                mHandler = new CameraHandler(this);
+            }
+            if (accStatus) {
+                open();
+            }
+
+            mSync.notifyAll();
+        }
+    }
+    public void open() {
+//        if (!isOpened()) {
+//            enter_lock();
+//            writeTextFile("1","/sys/class/gpiodrv/gpio_ctrl/video_resize");
+            mHandler.sendMessage(mHandler.obtainMessage(MSG_OPEN));
+       /* } else {
+            LogUtils.d(TAG, "already connected, just call callback");
+            startSignalWatch();
+        }*/
+    }
+     private boolean IS_REBOOT = false;
+    public void close(boolean isReboot) {
+        LogUtils.d(TAG, "----start close camera----------isReboot=" + isReboot);
+
+        IS_REBOOT = isReboot;
+
+//        writeTextFile("0", SettingPresenter.WATERMARK_ENABLE_NODE);
+
+//        handleClose();
+        if (mHandler != null) {
+            mHandler.sendEmptyMessage(MSG_CLOSE);
+        }
+    }public void startRecording() {
+        LogUtils.e("handlerThread _ startRecording=" + (!isRecording()));
+        if (!isRecording()) {
+            mHandler.sendEmptyMessage(MSG_CAPTURE_START);
+        }
+//        } else {
+//            mHandler.sendEmptyMessage(MSG_CAPTURE_STOP);
+//        }
+    }public void stopRecording() {
+        if (isRecording()) {
+            mHandler.sendEmptyMessage(MSG_CAPTURE_STOP);
+//            handleStopRecording();
+        }
+    }
+
+    public void captureStill(final String path, final int channel) {
+        handleCaptureStill(path, channel);
+
+//        mHandler.sendMessage(mHandler.obtainMessage(MSG_CAPTURE_STILL, channel, 0, path));
+    }
+    private void update_camera_open(boolean can_open) {
+        LogUtils.e("update_camera_open _ can open =" + can_open);
+        File file = new File(CAMERA_OPEN_PATH);
+        if (can_open) {
+            if (file.exists()) {
+                FileUtils.deleteFile(CAMERA_OPEN_PATH);
+            }
+        } else {
+            if (!file.exists()) {
+                try {
+                    file.createNewFile();
+                } catch (IOException e) {
+                    e.printStackTrace();
+                }
+            }
+        }
+    }
+    private void startSignalWatch() {
+
+        mCameraOpen.setInt(Config.PREVIEW_START);
+
+        isBackPreView = false;
+        isFrontPreView = false;
+    int videoSettingsType = SPUtils.getVideoSettings(mContext);//1：单录 2:双录
+        LogUtils.d("startSignalWatch---->当前视屏设置为 :" + videoSettingsType);
+        if (videoSettingsType ==Config.VIDEO_SETTINGS_SINGLE_1){
+
+            startSingleWatch0();
+            SPUtils.putBoolean(mContext,Config.SIGNAL,true);
+        }else if (videoSettingsType ==Config.VIDEO_SETTINGS_SINGLE){
+            LogUtils.d("startSignalWatch...单录:开始预览，无需检测信号...");
+            startSingleWatch1();
+            SPUtils.putBoolean(mContext,Config.SIGNAL,true); }else if (videoSettingsType == Config.VIDEO_SETTINGS_DOUBLE){
+            LogUtils.d("startSignalWatch...双录:开始检测信号...");
+           /* signalThread = new SignalThread();
+            signalThread.start();*/
+            ThreadpoolUtil.execute(signalRunnable);
+        }
+    }
+private Runnable signalRunnable = new Runnable() {
+        @Override
+        public void run() {
+             mCameraOpen.setInt(Config.PREVIEW_START);
+
+            isBackPreView = false;
+            isFrontPreView = false;
+//        checkCount = 0;
+            while (newSignal == 0 && !isInterrupted()) {
+                //每隔200ms检测一次倒车状态,非倒车状态则退出倒车
+                try {
+                    //底层是100ms同步状态，必须大于100getLocation
+                    sleep(200);} catch (InterruptedException e) {
+//                    e.printStackTrace();
+                    LogUtils.d("<-----SignalThread  InterruptedException--->");
+                    while (!isInterrupted()) {
+                        try {
+                            Thread.sleep(1000);
+                        } catch (InterruptedException ex) {
+                            interrupt();
+                        }
+                    }
+                    noSignalCount = 0;
+                }try {
+                    newSignal = Integer.valueOf(readTextFile(CAMERA_SIGNAL_NODE));
+                    LogUtils.d(TAG, "read Signal:" + newSignal);
+                    if (newSignal == 1 && !getSurfaceCreated()) {
+                        LogUtils.e(TAG, "read Signal return :" + newSignal);
+                        newSignal = 0;
+                    }
+                } catch (Exception e) {
+                    e.printStackTrace();
+                }//首次有信号
+                if (newSignal == 1 && lastSignal == 0) {
+                    LogUtils.d("startSignalWatch  检测到信号...");
+                    SPUtils.putBoolean(mContext,Config.SIGNAL,true);
+                    lastSignal = newSignal;
+                    noSignalCount = 0;
+
+                    zHandler.sendEmptyMessage(MSG_BACK_SHOW);//同步设置
+                    int brightnessSave = RecordData.getInstance().brightness.getValue();
+                    int saturationSave = RecordData.getInstance().saturation.getValue();
+                    int contrastSave = RecordData.getInstance().contrast.getValue();
+                    FileUtils.writeTextFile(Config.KEY_BRIGHTNESS + brightnessSave, Config.CAMERA_PARAMS_NODE);
+                    FileUtils.writeTextFile(Config.KEY_SATURATION + saturationSave, Config.CAMERA_PARAMS_NODE);
+                    FileUtils.writeTextFile(Config.KEY_CONTRAST + contrastSave, Config.CAMERA_PARAMS_NODE);
+
+                    //开始预览
+                    LogUtils.d("startSignalWatch PLATFORM----------->" + PLATFORM); //mt6763
+                    if (PLATFORM.equals(Config.SYSTEM_PLATFORM_63) ||PLATFORM.equals(Config.SYSTEM_PLATFORM_65)) {
+                        zHandler.sendEmptyMessage(MSG_FRONT_SHOW);
+                        showFrontVideo();
+                    }
+                    showBackVideo();
+//                zHandler.sendEmptyMessage(MSG_NEWSIGNAL);
+                }
+                //一直无信号
+                if (newSignal == 0 && lastSignal == 0) {
+//                    DvrApplication.setInitCamera(true);
+                    noSignalCount++;
+                    //无信号状态持续6000ms后才显示无信号
+                    //检测60次,200ms一次
+                    if (noSignalCount * CHECK_PERIOD > 6000) {
+                     LogUtils.d("startSignalWatch  无信号...");
+                        //fixme 通知主线程显示无信号
+                        zHandler.sendEmptyMessage(MSG_NO_SIGNAL);
+
+                        DvrApplication.setInitCamera(true);
+                        //确定是否会一直检测...
+                        break;
+                    }
+                }//有信号变无信号
+                if (newSignal == 0 && lastSignal == 1) {
+                    LogUtils.d("startSignalWatch  信号中断...");
+                    lastSignal = newSignal;
+                    noSignalCount = 1;
+
+                    //fixme 通知主线程显示无信号
+                    zHandler.sendEmptyMessage(MSG_NO_SIGNAL);
+                }
+                LogUtils.d("noSignalCount:" + noSignalCount);
+            }
+        }
+    }; 
+    private void startSingleWatch0(){
+        mCameraOpen.setInt(Config.PREVIEW_START);
+
+        isBackPreView = false;
+        isFrontPreView = false;
+        zHandler.sendEmptyMessage(MSG_BACK_SHOW);
+         try {
+            Thread.sleep(300);
+        } catch (InterruptedException e) {
+            e.printStackTrace();
+        }
+        LogUtils.d("getCameraStatus0------->");
+        if (getCameraStatus()){//单录时,是否开始倒车
+            showBackVideo();
+            return;
+//            return;
+        }
+        showBackVideo();
+    }
+    private void startSingleWatch1(){
+        mCameraOpen.setInt(Config.PREVIEW_START);
+
+        isBackPreView = false;
+        isFrontPreView = false;
+        zHandler.sendEmptyMessage(MSG_FRONT_SHOW);
+         try {
+            Thread.sleep(300);
+        } catch (InterruptedException e) {
+            e.printStackTrace();
+        }
+
+        if (getCameraStatus()){//单录时,是否开始倒车
+            showBackVideo();
+//            return;
+        }else{
+            LogUtils.d("showFrontVideo----------------");
+            showFrontVideo();
+        }
+        checkStatus();
+    }
+    private boolean bFrontView = false;
+    private boolean bBackView = false;
+    public void setSurfaceCreate(int channel, boolean created) {
+        if (channel == Config.CHANNEL_FRONT) {
+            bFrontView = created;
+        } else if (channel == Config.CHANNEL_BACK) {
+            bBackView = created;
+        }
+    }
+     private boolean getSurfaceCreated() {
+        boolean ret = false;
+        if (PLATFORM.equals(Config.SYSTEM_PLATFORM_63) ||
+                PLATFORM.equals(Config.SYSTEM_PLATFORM_65)) {
+            ret = bFrontView && bBackView;
+        } else {
+            ret = bBackView;
+        }
+        LogUtils.d("getSurfaceCreated---frontview=" + bFrontView + ", backview=" + bBackView);
+        return ret;
+    }
+     private void stopSignalWatch() {
+        if (checkTimerID != 0) {
+            TimerUtils.killTimer(checkTimerID);
+            checkTimerID = 0;
+        }
+    }
+    public int checkMainCam(){
+        //open main
+        boolean isBok;
+
+        isBok = openCameraBack(false);
+
+        if(isBok){
+            int cameraBType = FileUtils.readNodeFile(Config.CAMERA_GET_TYPE_NODE);
+            LogUtils.d(TAG, "---checkCamera isBok=" + isBok + ",,cameraBType=" + cameraBType);
+            closeBackCamera();
+            return cameraBType;
+        }
+        //open 失败的情况
+        LogUtils.d(TAG, "---checkCamera  main启动失败，  CAMERA_ERROR");
+        return Config.CAMERA_ERROR;
+    }
+    public int checkSubCam(){
+        //open sub
+        boolean isFok = openCameraFront(false);
+        if(isFok){
+            int cameraFType = FileUtils.readNodeFile(Config.CAMERA_GET_TYPE_NODE);
+            LogUtils.d(TAG, "---checkCamera isFok=" + isFok + ",,cameraFType=" + cameraFType);
+            closeFontCamera();
+
+            return cameraFType;
+        }
+        //open 失败的情况
+        LogUtils.d(TAG, "---checkCamera  sub启动失败，  CAMERA_ERROR");
+        return Config.CAMERA_ERROR;
+    }
+    protected void enter_lock() {
+    ////////////////
+        LogUtils.d(TAG, "开始open camera......lock PLATFORM=" + PLATFORM);
+
+        mLock.lock();
+        LogUtils.d(TAG, "开始open camera......上锁...");
+        try {
+
+            String status = readTextFile(Config.CAMERA_WORK_STATUS_NODE);
+            LogUtils.d(TAG, "开始open camera......检测status=" + status);
+             mCameraOpen.setInt(AvinDefine.CameraOpen.OPEN_START);
+                setCameraParameter();
+                int videoSettingsType =  SPUtils.getVideoSettings(mContext);//0:单路1 1：单录2 2:双录
+
+                if (PLATFORM.equals(Config.SYSTEM_PLATFORM_63) ||
+                        PLATFORM.equals(Config.SYSTEM_PLATFORM_65) ) {
+                    if (videoSettingsType ==Config.VIDEO_SETTINGS_SINGLE_1){
+                    /////////////////////////////////////////
+                        openCameraBack(true);
+                        }else if (videoSettingsType ==Config.VIDEO_SETTINGS_SINGLE){
+                        boolean statusCamera  = getCameraStatus();
+                        LogUtils.d("是否是倒车-statusCamera------------>" + statusCamera);
+                        if (!statusCamera){
+                            openCameraFront(true);
+                        }else {
+                            openCameraBack(true);
+                        }
+
+                    }else if (videoSettingsType ==Config.VIDEO_SETTINGS_DOUBLE){
+                        openCameraFront(true);
+                        openCameraBack(true);
+                    } LogUtils.d(TAG, "开始open camera......处理完成, 状态isFrontOpen=" + isFrontOpen());
+                }else if(PLATFORM.equals(Config.SYSTEM_PLATFORM_39) ||
+                        PLATFORM.equals(Config.SYSTEM_PLATFORM_61)){
+                    openCameraBack(true);
+
+                }
+                } catch (Exception e) {
+            LogUtils.d(TAG, "enter_lock.....e=" + e.toString());
+
+            mLock.unlock();
+        } finally {
+
+            LogUtils.d(TAG, "开始open camera......释放锁...");
+            mLock.unlock();
+        }
+        //通知main
+        mainHandler.sendMessage(mainHandler.obtainMessage(Config.MSG_SYNC_OK, true));
+    }
+    private static final String AUTHORITY = "com.wwc2.main.provider.logic";
+    private static final String CAMERA_STATUS = "camera_status";
+    public static Uri uri_camera    = Uri.parse("content://" + AUTHORITY + "/" + CAMERA_STATUS);
+
+    /**
+     * 查询当前camera状态是否是倒车
+     * @return
+     */
+    private boolean getCameraStatus() {
+        boolean ret = false;
+        String camera = mContext.getContentResolver().getType(uri_camera);
+        if (camera != null) {
+            ret = camera.equals("true") ? true : false;
+        }
+        LogUtils.d("getCameraStatus----isReversing=" + ret);
+        return ret;
+    }
+    private void setCameraParameter(){
+        LogUtils.d(TAG, "setCameraParameter...配置参数..");
+        //sensor
+        Utils.writeTextFile(SPUtils.getSensor(mContext)+"", Config.SENSOR_NODE);
+        LogUtils.e("......SENSOR.000..test=" + Utils.readTextFile(Config.SENSOR_NODE));
+
+        String camera_value = RecordData.getInstance().cameraType.getValue();
+        if(!TextUtils.isEmpty(camera_value)){
+            LogUtils.d(TAG, "camera ####设置  CAMERA_TYPE=" + camera_value);
+            writeTextFile(camera_value, Config.CAMERA_360_TYPE_NODE);
+            try {
+                String testType = readTextFile(Config.CAMERA_360_TYPE_NODE);
+                LogUtils.d(TAG, "camera ####设置  get CAMERA_360_TYPE_NODE=" + testType);
+            } catch (Exception e) {
+                LogUtils.d(TAG, "camera ####设置  get CAMERA_360_TYPE_NODE err=" + e.toString());
+            }
+        }
+        String video_value = SPUtils.getString(mContext, Config.VIDEO_VALUE, Config.VIDEO_VALUE_DEF);
+        if(!TextUtils.isEmpty(video_value)){LogUtils.d(TAG, "camera ####设置  VIDEO_SWITCH=" + video_value);
+            writeTextFile(video_value, Config.VIDEO_SWITCH_NODE);
+
+            try {
+                String testSwitch = readTextFile(Config.VIDEO_SWITCH_NODE);
+                LogUtils.d(TAG, "camera ####设置  get VIDEO_SWITCH_NODE=" + testSwitch);
+            } catch (Exception e) {
+                LogUtils.d(TAG, "camera ####设置  get VIDEO_SWITCH_NODE err=" + e.toString());
+            }
+        }
+
+        //显示时间水印
+        if (SPUtils.getWaterMark(mContext)) {
+            LogUtils.d(TAG, "---showWaterMark---");
+            SystemProperties.set(Config.RECORD_WATERMASK, "1");
+        } else {
+            LogUtils.d(TAG, "---hideWaterMark---");
+            SystemProperties.set(Config.RECORD_WATERMASK, "0");
+        }
+
+        boolean main = SPUtils.getM_Mirror(mContext);
+        boolean sub = SPUtils.getS_Mirror(mContext);
+        if(main && sub){
+            SystemProperties.set(Config.SET_MIRROR, Config.DUAL_MIRROR);
+        }else if(!main && !sub){
+            SystemProperties.set(Config.SET_MIRROR, Config.DUAL_NORMAL);
+        } else if(main && !sub){
+            SystemProperties.set(Config.SET_MIRROR, Config.MAIN_MIRROR);
+        }else if(!main && sub){
+            SystemProperties.set(Config.SET_MIRROR, Config.SUB_MIRROR);
+        }
+
+        SystemProperties.set(Config.RECORD_ENABLE, "1");
+        //设置录制分辨率
+        //未手动设置则采用底层默认的分辨率录制。
+        String mainRecordType = RecordData.getInstance().recordTypeMain.getValue();
+        if (mainRecordType.equals(Config.VIDEO_SIZE_INVALID)) {
+            String type = Config.getRecordType(camera_value.substring(0, 1));
+            LogUtils.e("mainRecordType----" + mainRecordType + " ,type=" + type);
+            if (mainHandler != null) {//需在主线程中处理，否则会出错。2019-11-25
+                mainHandler.post(new Runnable() {
+                    @Override
+                    public void run() {
+                        RecordData.getInstance().recordTypeMain.setValue(type);
+                        SPUtils.putString(mContext, Config.KEY_RECORD_TYPE_MAIN, type);
+                    }
+                });
+            }
+             mainRecordType = type;
+        }
+        if (!mainRecordType.equals(Config.VIDEO_SIZE_INVALID)) {
+            SystemProperties.set(Config.RECORD_SUPPORT_MAIN, mainRecordType);
+        }
+
+        String subRecordType = RecordData.getInstance().recordTypeSub.getValue();
+        if (subRecordType.equals(Config.VIDEO_SIZE_INVALID)) {
+            String type = Config.getRecordType(camera_value.substring(1));
+            LogUtils.e("mainRecordType--0--subRecordType=" + subRecordType + ", type=" + type);
+            if (mainHandler != null) {//需在主线程中处理，否则会出错。2019-11-25
+                mainHandler.post(new Runnable() {@Override
+                    public void run() {
+                        RecordData.getInstance().recordTypeSub.setValue(type);
+                        SPUtils.putString(mContext, Config.KEY_RECORD_TYPE_SUB, type);
+                    }
+                });
+            }
+            subRecordType = type;
+        }
+        if (!subRecordType.equals(Config.VIDEO_SIZE_INVALID)) {
+            SystemProperties.set(Config.RECORD_SUPPORT_SUB, subRecordType);
+        }
+    }
+    protected void leave_lock() {
+
+        LogUtils.d(" close camera..handleClose...leave_lock..33");
+        mLock.lock();
+        LogUtils.d(TAG, "---close Camera----上锁----------");
+
+        try {
+
+            mCameraOpen.setInt(AvinDefine.CameraOpen.CLOSE_START);
+            if (0 != mQueryCameraOpenTimerId) {
+                TimerUtils.killTimer(mQueryCameraOpenTimerId);
+                mQueryCameraOpenTimerId = 0;
+                cameraCheckState = 0;
+            stopSignalWatch();
+
+            int videoSettingsType =  SPUtils.getVideoSettings(mContext);//1：单录 2:双录
+
+                    LogUtils.d(TAG_THREAD, "33  test   释放资源..." + videoSettingsType);
+            SystemProperties.set(Stereo.CAMERA_ENABLE_DISPLAY, Stereo.CAMERA_ENABLE_DISPLAY_SHOW);
+
+            if (videoSettingsType ==Config.VIDEO_SETTINGS_SINGLE_1){
+            closeBackCamera();
+            }else if (videoSettingsType ==Config.VIDEO_SETTINGS_SINGLE){
+                LogUtils.d("getCameraStatus--->" + getCameraStatus());
+                if (getCameraStatus()){
+                    closeBackCamera();
+                }else {
+                    closeFontCamera();
+                }
+
+            }else if (videoSettingsType ==Config.VIDEO_SETTINGS_DOUBLE){
+                closeFontCamera();
+                closeBackCamera();
+
+            }
+            mCameraOpen.setInt(AvinDefine.CameraOpen.CLOSE_OVER);
+            //退出时关闭镜像功能,避免影响360全景功能
+            writeTextFile("0", CAMERA_MIRROR);
+            } catch (Exception e){
+
+            LogUtils.d(TAG, "---close Camera----error------e=" + e.toString());
+
+            mLock.unlock();
+        }
+//        finally {
+//            mLock.unlock();
+//        }
+    }
+     public boolean isCameraBackOpened() {
+        synchronized (mSync) {
+            return mCameraBack != null;
+        }
+    }
+    public boolean isCameraFrontOpened() {
+        synchronized (mSync) {
+            return mCameraFront != null;
+        }
+    } 
+    public boolean isRecording() {
+        String record = SystemProperties.get(Config.RECORD_ACTION);
+        LogUtils.d(TAG, "isRecording...record=" + record);
+        if(record.equals(Config.RECORD_VIDEO_MAIN_RUNNING) ||
+                record.equals(Config.RECORD_VIDEO_SUB_RUNNING) ||
+                record.equals(Config.RECORD_VIDEO_AUDIO_MAIN_RUNNING) ||
+                record.equals(Config.RECORD_VIDEO_AUDIO_SUB_RUNNING) ||
+                record.equals(Config.RECORD_VIDEO_DUAL_RUNNING) ||
+                record.equals(Config.RECORD_VIDEO_AUDIO_DUAL_RUNNING)){
+            return true;
+        }
+        return false;
+    }
+    private void handleOpen() {
+        LogUtils.e("---------------handle_Open Camera!");
+//        handleClose();
+
+
+        synchronized (mSync) {
+            enter_lock();
+//                LogUtils.i(TAG, "supportedSize:" + mCamera.getSupportedSize());
+        }
+
+
+    }
+    public void handleClose() {
+        if(isRecording() && !getCameraStatus()){
+            LogUtils.d(" close camera..正在录制中..先停止录制...");
+            handleStopRecording();
+        }
+        LogUtils.d(" close camera..handleClose...11");
+        synchronized (mSync) {
+            LogUtils.d(" close camera..handleClose...22");
+            leave_lock();
+        }
+    }
+    private void handleStopPreview() {
+        LogUtils.d(TAG_THREAD, "handleStopPreview:");
+
+//        LogUtils.d(TAG_THREAD, "11  test   释放资源...");
+        SystemProperties.set(Stereo.CAMERA_ENABLE_DISPLAY, Stereo.CAMERA_ENABLE_DISPLAY_SHOW);
+
+        if (mCameraBack != null) {
+            mCameraBack.stopPreview();
+        }
+        if (mCameraFront != null) {
+            mCameraFront.stopPreview();
+        }
+        synchronized (mSync) {
+            mSync.notifyAll();
+        }
+    }
+    public boolean gettakePhotoRunning(int channel) {
+        if (channel == Config.CHANNEL_FRONT) {
+            return subRunning;
+        }
+
+        return mainRunning;
+    }
+
+    private int MAX = 5;
+    private int mainindex = 0;
+    private boolean mainRunning = false;
+    private Runnable mainRunn = new Runnable() {
+        @Override
+        public void run() {
+
+            LogUtils.d("22===  test:" + SystemProperties.get(Config.CAPTURE_ACTION_MAIN));
+
+            String action = SystemProperties.get(Config.CAPTURE_ACTION_MAIN);
+            LogUtils.d("33===  test:" + SystemProperties.get(Config.CAPTURE_ACTION_MAIN));
+            //成功
+            if (action.equals(Config.CAPTURE_STOP)) {
+                LogUtils.d(TAG_THREAD, "mainRunn...成功...action:" + action);
+                zHandler.sendEmptyMessage(MSG_PHOTO_FINISH);
+                mainRunning = false;
+            } else {
+                if (action.equals(Config.CAPTURE_FAIL)) {//失败
+                    LogUtils.d(TAG_THREAD, "mainRunn...失败...action:" + action);
+                    LogUtils.d(TAG_THREAD, "mainRunn...重新开始拍照");
+                    zHandler.sendEmptyMessage(MSG_PHOTO_FAIL);
+                    SystemProperties.set(Config.CAPTURE_ACTION_MAIN, Config.CAPTURE_START);
+                     LogUtils.d(TAG_THREAD, "mainRunn...失败...重试...mainindex=" + mainindex);
+                    if (mainindex > MAX) {
+                        mainindex = 0;
+                        mainHandler.removeCallbacks(mainRunn);
+                        mainRunning = false;
+                        return;
+                    }
+                    mainindex++;
+                    mainHandler.removeCallbacks(mainRunn);
+                    //底层1秒检测1次，至少1500秒
+                    mainHandler.postDelayed(mainRunn, 1500);
+                     } else if (action.equals(Config.CAPTURE_RUNNING)) {//预览失败
+                    LogUtils.d(TAG_THREAD, "mainRunn...运行中或者预览失败...action:" + action
+                            + "...重试..重新启动拍照.mainindex=" + mainindex);
+                    //启动拍照
+                    SystemProperties.set(Config.CAPTURE_ACTION_MAIN, Config.CAPTURE_START);
+
+                    if (mainindex > MAX) {
+                        mainindex = 0;
+                        mainHandler.removeCallbacks(mainRunn);
+                        mainRunning = false;
+                        return;
+                    }
+                    mainindex++;
+                    mainHandler.removeCallbacks(mainRunn);
+                    //底层1秒检测1次，至少1500秒
+                    mainHandler.postDelayed(mainRunn, 1500);
+                }
+            } 
+            }
+    };
+
+    private int subindex = 0;
+    private boolean subRunning = false;
+    private Runnable subRunn = new Runnable() {
+        @Override
+        public void run() {
+
+
+            String action = SystemProperties.get(Config.CAPTURE_ACTION_SUB);
+            LogUtils.d("44===  test:" + SystemProperties.get(Config.CAPTURE_ACTION_SUB));
+            //成功
+            if(action.equals(Config.CAPTURE_STOP)){
+                LogUtils.d(TAG_THREAD, "subRunn...成功...action:" + action);
+                zHandler.sendEmptyMessage(MSG_PHOTO_FINISH);
+                subRunning = false;
+                 }else if(action.equals(Config.CAPTURE_FAIL)){//失败
+                LogUtils.d(TAG_THREAD, "subRunn...失败...action:" + action);
+                zHandler.sendEmptyMessage(MSG_PHOTO_FAIL);
+                //前摄启动拍照
+                SystemProperties.set(Config.CAPTURE_ACTION_SUB, Config.CAPTURE_START);
+                LogUtils.d(TAG_THREAD, "subRunn...失败...重试...subindex=" + subindex);
+                if(subindex > MAX){
+                    subindex = 0;
+                    mainHandler.removeCallbacks(subRunn);
+                    subRunning = false;
+                    return;
+                }
+                subindex++;
+                mainHandler.removeCallbacks(subRunn);
+                //底层1秒检测1次，至少1500秒
+                mainHandler.postDelayed(subRunn, 1500);
+            }else if(action.equals(Config.CAPTURE_RUNNING)){//预览失败
+                LogUtils.d(TAG_THREAD, "subRunn...预览失败...action:" + action
+                        + "...重试...subindex=" + subindex);
+                //前摄启动拍照
+                SystemProperties.set(Config.CAPTURE_ACTION_SUB, Config.CAPTURE_START);
+                if(subindex > MAX){
+                    subindex = 0;
+                    mainHandler.removeCallbacks(subRunn);
+                    subRunning = false;
+                    return;
+                }
+                 subindex++;
+                mainHandler.removeCallbacks(subRunn);
+                //底层1秒检测1次，至少1500秒
+                mainHandler.postDelayed(subRunn, 1500);
+            }
+        }
+    };
+/**
+     * 拍照
+     * @param path
+     * @param channel 2=主摄像头，1=副摄像头
+     */
+    private void handleCaptureStill(final String path, final int channel) {
+    SystemProperties.set(Config.CAPTURE_FILE_NAME, path);
+        int videoSettingsType =  SPUtils.getVideoSettings(mContext);//0:单路1 1：单录2 2:双录
+
+        if (videoSettingsType ==Config.VIDEO_SETTINGS_DOUBLE){
+            switch (channel){
+                //主摄
+                case Config.CHANNEL_BACK:
+                    LogUtils.d("11===  test:" + SystemProperties.get(Config.CAPTURE_ACTION_MAIN));
+                    LogUtils.d("takePicture---main--开始拍照");
+                    mainRunning = true;
+                    //启动拍照
+                    SystemProperties.set(Config.CAPTURE_ACTION_MAIN, Config.CAPTURE_START);
+                     //底层1秒检测1次，至少1500秒
+                    mainHandler.removeCallbacks(mainRunn);
+                    mainHandler.postDelayed(mainRunn, 1500);
+                    break;
+                //副摄
+                case Config.CHANNEL_FRONT:
+                    LogUtils.d("takePicture---sub--开始拍照");
+                    subRunning = true;
+
+                    SystemProperties.set(Config.CAPTURE_ACTION_SUB, Config.CAPTURE_START);
+                    mainHandler.removeCallbacks(subRunn);
+                    mainHandler.postDelayed(subRunn, 1500);
+                    break;
+            }
+             }else if (videoSettingsType ==Config.VIDEO_SETTINGS_SINGLE){
+            if (channel == 1){
+                LogUtils.d("takePicture 单录 : ---sub--开始拍照");
+                SystemProperties.set(Config.CAPTURE_ACTION_SUB, Config.CAPTURE_START);
+
+                mainHandler.removeCallbacks(subRunn);
+                mainHandler.postDelayed(subRunn, 1500);
+            }
+        }
+
+
+    }
+    /**
+     * 录像
+     */
+    private void handleStartRecording() {
+
+        LogUtils.d(TAG_THREAD, "handleStartRecording:  开始.启动录像流程..");
+
+        //检测时长
+        int saveTime = SPUtils.getAutoSaveTime(mContext);
+        if(saveTime > 0){
+            if (saveTime ==3){
+                saveTime = 5;
+            }
+            LogUtils.d(TAG, "---handleStartRecording---saveTime=" + saveTime);
+            SystemProperties.set(Config.SAVE_FILEMAXDURATION, saveTime+"");
+        }
+        //设置保存路径
+        String path = StorageDevice.getPath(SPUtils.getLocation(mContext));
+        if (!FileUtils.isDiskMounted(mContext, path)) {
+            LogUtils.e("handleStartRecording return path=" + path + " is not exist!");
+            if (accStatus) {
+                //通知main
+                mainHandler.sendMessage(mainHandler.obtainMessage(Config.MSG_SYNC_OK, true));
+                return;
+            } else {
+                //ACC OFF在USB未挂载的情况下先录制到本地，检测到USB插入时再拷贝到USB。2020-01-19
+                path = StorageDevice.getPath(StorageDevice.NAND_FLASH) +
+                        ConstantsData.VIDEO_DIR + SPUtils.getLocation(mContext);
+            }
+             } else {
+            path = path + ConstantsData.VIDEO_DIR;
+        }
+
+        if(!TextUtils.isEmpty(path)){
+//            path = path + ConstantsData.VIDEO_DIR;
+            LogUtils.d(TAG, "---handleStartRecording---path=" + path);
+            SystemProperties.set(Config.SAVE_DIRECTORY, path);
+        }
+
+       sendRecordValue();
+new Thread(new Runnable() {
+            @Override
+            public void run() {
+                while (true){
+                    try {
+                        //成功or失败，都要通知
+                        if(rebootVideo){
+                            //通知main.
+                            mainHandler.sendMessage(mainHandler.obtainMessage(Config.MSG_SYNC_OK, true));
+                            //此处释放状态
+                            rebootVideo = false;
+                        }
+                        String action = SystemProperties.get(Config.RECORD_ACTION);
+                        LogUtils.d(TAG, "handleStartRecording...录像 action=" + action);
+                        if(action.equals(Config.RECORD_UNKONW)){
+                            LogUtils.d(TAG, "syncCameraAction...录像失败!");
+                            handleStopRecording();
+                            break;
+                        }else if(action.contains("2")){
+                                LogUtils.d(TAG, "syncCameraAction...录像成功!  action=" + action);
+                                mainHandler.sendMessage(mainHandler.obtainMessage(MSG_RECORD_STATUS, true));
+
+                            break;
+                        }
+                        Thread.sleep(1000);
+                    } catch (InterruptedException e) {
+                        e.printStackTrace();
+                    }
+                }
+            }
+        }).start();
+
+    }
+    public void sendRecordValue(){
+        //是否静音录像
+        final boolean isMute = SPUtils.getMuteRecord(mContext);
+        LogUtils.d(TAG_THREAD, "isMute:"+isMute);
+
+        //再次检测，先停止
+        String test = SystemProperties.get(Config.RECORD_ACTION);
+        LogUtils.d(TAG_THREAD, ".....是否需要异常重置......handleStartRecording_test="+ test);
+
+        if(!test.equals(Config.RECORD_UNKONW)){
+            LogUtils.d(TAG_THREAD, ".....异常，重置......handleStartRecording_test="+ test);
+            String a = (Integer.parseInt(test) +1)+"";
+            LogUtils.d(TAG_THREAD, ".....异常，重置....a="+ a);
+            SystemProperties.set(Config.RECORD_ACTION, a);
+            try {
+                Thread.sleep(1000);
+            } catch (InterruptedException e) {
+             e.printStackTrace();
+            }
+        }
+
+        LogUtils.d(TAG_THREAD, ".....start....isBackOpen="+ isBackOpen()
+                + ",,--isFrontOpen=" + isFrontOpen());
+        int videoSettingsType =  SPUtils.getVideoSettings(mContext);//0:单路1 1：单录2 2:双录
+        String code =  Config.getWTDVR_STYLE();
+        LogUtils.d("handleStartRecording--------code-->" + code + "   videoSettingsType----->" + videoSettingsType);
+        //静音
+        if(isMute){//静音
+            if ( PLATFORM.equals(Config.SYSTEM_PLATFORM_39) || PLATFORM.equals(Config.SYSTEM_PLATFORM_61)){
+                if (code.equals(Config.WTDVR_STYLE_DOUBLE_CODE)){
+                    SystemProperties.set(Config.RECORD_ACTION, Config.RECORD_VIDEO_DUAL_START);
+                }else if (code.equals(Config.WTDVR_STYLE_ONE_CODE)){
+                    SystemProperties.set(Config.RECORD_ACTION, Config.RECORD_VIDEO_MAIN_START);
+                }
+            }else if (PLATFORM.equals(Config.SYSTEM_PLATFORM_63)||PLATFORM.equals(Config.SYSTEM_PLATFORM_65)){
+                if(code.equals(Config.WTDVR_STYLE_DOUBLE_CODE)){
+                    if(isBackOpen() && isFrontOpen()){
+                     SystemProperties.set(Config.RECORD_ACTION, Config.RECORD_VIDEO_DUAL_START);
+                    }else if(isBackOpen() && !isFrontOpen()){
+                        SystemProperties.set(Config.RECORD_ACTION, Config.RECORD_VIDEO_MAIN_START);
+                    }else if(!isBackOpen() && isFrontOpen()){
+                        LogUtils.d("------RECORD_VIDEO_SUB_START-----------------");
+                        SystemProperties.set(Config.RECORD_ACTION, Config.RECORD_VIDEO_SUB_START);
+                    }
+                }else if (code.equals(Config.WTDVR_STYLE_ONE_CODE)){
+                    if(isBackOpen() && !isFrontOpen()){
+                        SystemProperties.set(Config.RECORD_ACTION, Config.RECORD_VIDEO_MAIN_START);
+                    }else if (!isBackOpen() &&isFrontOpen()){
+                        SystemProperties.set(Config.RECORD_ACTION, Config.RECORD_VIDEO_SUB_START);
+                    }
+                }
+            }
+             }else{//非静音
+            if ( PLATFORM.equals(Config.SYSTEM_PLATFORM_39) || PLATFORM.equals(Config.SYSTEM_PLATFORM_61)){
+                if(code.equals(Config.WTDVR_STYLE_DOUBLE_CODE)){
+                    SystemProperties.set(Config.RECORD_ACTION, Config.RECORD_VIDEO_AUDIO_DUAL_START);
+                }else if (code.equals(Config.WTDVR_STYLE_ONE_CODE)){
+                    SystemProperties.set(Config.RECORD_ACTION, Config.RECORD_VIDEO_AUDIO_MAIN_START);
+                }
+
+            }else if (PLATFORM.equals(Config.SYSTEM_PLATFORM_63)|| PLATFORM.equals(Config.SYSTEM_PLATFORM_65)){
+                if(code.equals(Config.WTDVR_STYLE_DOUBLE_CODE)){
+                 if(isBackOpen() && isFrontOpen()){
+                        SystemProperties.set(Config.RECORD_ACTION, Config.RECORD_VIDEO_AUDIO_DUAL_START);
+                    }else if(isBackOpen() && !isFrontOpen()){
+                        SystemProperties.set(Config.RECORD_ACTION, Config.RECORD_VIDEO_AUDIO_MAIN_START);
+                    }else if(!isBackOpen() && isFrontOpen()){
+                        SystemProperties.set(Config.RECORD_ACTION, Config.RECORD_VIDEO_AUDIO_SUB_START);
+                    }
+                }else if (code.equals(Config.WTDVR_STYLE_ONE_CODE)){
+                    if(isBackOpen() && !isFrontOpen()){
+                        SystemProperties.set(Config.RECORD_ACTION, Config.RECORD_VIDEO_AUDIO_MAIN_START);
+                    }else if (!isBackOpen() &&isFrontOpen()){
+                        SystemProperties.set(Config.RECORD_ACTION, Config.RECORD_VIDEO_AUDIO_SUB_START);
+                    }
+                }
+            }
+
+  }
+    }
+ /**
+     * 720p自动保存时间
+     * @param time
+     * @return
+     */
+    private int get720pSaveTime(int time){
+        final int minutes = (time % (1000 * 60 * 60)) / (1000 * 60);
+        switch (minutes){
+            case 1://1分钟
+                return 23;
+            case 2://2分钟
+                return 46;
+            case 5://5分钟
+                return 115;
+        }
+        return 23;
+    }
+     /**
+     * 1080p自动保存时间
+     * @param time
+     * @return
+     */
+    private int get1080pSaveTime(int time){
+        final int minutes = (time % (1000 * 60 * 60)) / (1000 * 60);
+        switch (minutes){
+            case 1://1分钟
+                return 46;
+            case 2://2分钟
+                return 92;
+            case 5://5分钟
+                return 230;
+        }
+        return 46;
+    }
+    private void handleStopRecording() {
+        String action = SystemProperties.get(Config.RECORD_ACTION);
+        LogUtils.d(TAG_THREAD, "handleStopRecording  ... 停止录像 ... 当前action=" + action);
+        if(!action.equals(Config.RECORD_UNKONW)){
+            String stop = (Integer.parseInt(action) +1)+"";
+            LogUtils.d(TAG_THREAD, ".....停止....stop="+ stop);
+            SystemProperties.set(Config.RECORD_ACTION, stop);
+
+            //设置停止标识后，必须延时1秒，给底层时间，保存文件需要时间
+//            try {
+//                Thread.sleep(1000);
+//            } catch (InterruptedException e) {
+//                e.printStackTrace();
+//            }
+        }
+        mainHandler.sendMessage(mainHandler.obtainMessage(MSG_RECORD_STATUS, false));
+    }
+    private Handler zHandler = new Handler(){
+        @Override
+        public void handleMessage(Message msg) {
+            super.handleMessage(msg);
+            switch (msg.what) {
+                case MSG_NO_SIGNAL://没检测到信号
+                    mainHandler.sendMessage(mainHandler.obtainMessage(Config.MSG_NO_SIGNAL, false));
+                    if (PLATFORM.equals(Config.SYSTEM_PLATFORM_63) ||
+                            PLATFORM.equals(Config.SYSTEM_PLATFORM_65)) {
+                        frontCView.setVisibility(View.GONE);
+                    }
+                    backCView.setVisibility(View.GONE);
+                    SPUtils.putBoolean(mContext,Config.SIGNAL,false);
+                    ToastUtils.showShort(mContext.getResources().getString(R.string.no_signal));
+                    LogUtils.d("-未检测到信号-");
+                    break;
+                    case MSG_PHOTO_FINISH://拍照完成
+                    ToastUtils.showShort(mContext.getResources().getString(R.string.photo_finish));
+                    break;
+                case MSG_PHOTO_FAIL://拍照失败
+                    ToastUtils.showShort(mContext.getResources().getString(R.string.photo_fail));
+                    break;
+                case MSG_PHOTO_ERR://拍照异常
+                    ToastUtils.showShort(mContext.getResources().getString(R.string.photo_err));
+                    break;
+                case MSG_BACK_SHOW://显示后摄
+                    backCView.setVisibility(View.VISIBLE);
+                    break;
+                case MSG_FRONT_SHOW://显示前摄
+                    frontCView.setVisibility(View.VISIBLE);
+                    break;
+            }
+        }
+    };
+    /**
+     * 显示视频
+     */
+    public boolean openCameraBack(boolean isPreView) {
+        LogUtils.d(TAG, "---openCameraBack--打开后摄--");
+
+        boolean ret = false;
+
+        int videoSettingsType =  SPUtils.getVideoSettings(mContext);//0:单路1 1：单路2 2:双路
+        if(videoSettingsType ==Config.VIDEO_SETTINGS_SINGLE_1){
+            return  startOpenBack(isPreView);
+        }else {
+            if (null == mCameraBack) {
+
+               return startOpenBack(isPreView);
+            } else {
+//            mCameraOpen.setInt(AvinDefine.CameraOpen.OPEN_OVER);
+                LogUtils.w(TAG, "camera ####warning, video open, Camera object inited.");
+            }
+        }
+          return ret;
+    }
+
+    public boolean openCameraFront(boolean isPreView) {
+                LogUtils.d(TAG, "---openCameraFront--打开前摄-");
+                boolean ret = false;
+        int videoSettingsType =  SPUtils.getVideoSettings(mContext);//1：单录 2:双录
+
+                if (null == mCameraFront) {
+ SystemProperties.set(Stereo.CAMERA_ENABLE_DISPLAY, Stereo.CAMERA_ENABLE_DISPLAY_SHOW);
+
+                    LogUtils.d(TAG, "mCameraFront ####open start--PLATFORM = " + PLATFORM);
+
+                    //zhongyang.hu modify ,we use front camera instead .so change the order.
+                    try {
+                        if (PLATFORM.equals(Config.SYSTEM_PLATFORM_39) ||
+                                PLATFORM.equals(Config.SYSTEM_PLATFORM_61)) {
+                            mCameraFront = Camera.open(2);//ch006平台检测时需要打开Camera 2
+                        } else if (PLATFORM.equals(Config.SYSTEM_PLATFORM_63) ||
+                                PLATFORM.equals(Config.SYSTEM_PLATFORM_65)) {
+                            mCameraFront = Camera.open(Camera.CameraInfo.CAMERA_FACING_FRONT);
+                        } 
+                        } catch (RuntimeException e) {
+                        LogUtils.e(TAG, " 前摄 ...camera ###open failed,error = " + e.getMessage());
+                        e.printStackTrace();
+                    if (videoSettingsType ==Config.VIDEO_SETTINGS_SINGLE){
+                        if(isPreView){
+                            LogUtils.e(TAG, " 前摄 ... open camera 失败,强制重启...");
+                            mCameraBack = null;
+                            DvrApplication.setInitCamera(true);
+                            rebootCamera();
+                        }else{
+                            LogUtils.e(TAG, "CameraBack 自动检测逻辑，无需重启...");
+                        }
+                    }
+                    return false;
+                    }
+            LogUtils.d(TAG, "mCameraFront ####open camera over, mCameraFront = " + mCameraFront);
+            ret = (null != mCameraFront);
+            if (videoSettingsType ==Config.VIDEO_SETTINGS_SINGLE){
+                if(isPreView){
+                    if (ret) {
+                        LogUtils.e(TAG, " 前摄 ... open camera  准备开始预览...");
+                        //摄像头打开成功
+                        mCameraOpen.setInt(AvinDefine.CameraOpen.OPEN_OVER);
+                    } else {
+                        mCameraOpen.setInt(AvinDefine.CameraOpen.OPEN_FAILED);
+                    }
+                     }
+            }
+        } else {
+            LogUtils.w(TAG, "mCameraFront ####warning, video open, mCameraFront object inited.");
+        }
+        return ret;
+    }
+     private boolean startOpenBack(boolean isPreView){
+        boolean ret = false;
+        SystemProperties.set(Stereo.CAMERA_ENABLE_DISPLAY, Stereo.CAMERA_ENABLE_DISPLAY_SHOW);
+
+        LogUtils.d(TAG, "camera ####open start");
+        String code =  Config.getWTDVR_STYLE();
+        LogUtils.d(TAG, "camera ####open start code--->" + code);
+
+        //zhongyang.hu modify ,we use front camera instead .so change the order.
+        try {
+            if(isPreView && (PLATFORM.equals(Config.SYSTEM_PLATFORM_39) || PLATFORM.equals(Config.SYSTEM_PLATFORM_61))  &&  code.equals(Config.WTDVR_STYLE_DOUBLE_CODE)){
+                //open stereo
+                LogUtils.d(TAG, "camera ####open start 当前为双录底板" );
+                Stereo.callMethodOnObject(Stereo.PROPERTY_KEY_CLIENT_APP_MODE,
+                        Stereo.APP_MODE_NAME_MTK_DUAL_CAMERA);
+            }
+             mCameraBack = Camera.open(Camera.CameraInfo.CAMERA_FACING_BACK);
+        } catch (RuntimeException e) {
+//                e.printStackTrace();
+            LogUtils.e(TAG, " 后摄 ...camera ###open failed,error = " + e.getMessage());
+            if(isPreView){
+                LogUtils.e(TAG, " 后摄 ... open camera 失败,强制重启...");
+                mCameraBack = null;
+                DvrApplication.setInitCamera(true);
+                rebootCamera();
+            }else{
+                LogUtils.e(TAG, "CameraBack 自动检测逻辑，无需重启...");
+            }
+               return false;
+        }
+        LogUtils.d(TAG, "camera ####open ...后.摄打开完成,, mCamera="
+                + mCameraBack + ",,isBackOpen=" + isBackOpen());
+
+
+        IS_REBOOT = false;
+        LogUtils.d(TAG, "开始open camera......摄像头启动流程完毕...重置IS_REBOOT状态=" + IS_REBOOT);
+
+        ret = (null != mCameraBack);
+        if (!ret) {
+            if (null != mContext) {
+            //                        Toast.makeText(mContext, mContext.getString(R.string.open_camera_failed), Toast.LENGTH_SHORT);
+            }
+        }
+
+        LogUtils.e(TAG, " 后摄 ... open camera  检测是否需要预览...isPreView=" + isPreView);
+        if(isPreView){
+            if (ret) {
+                LogUtils.e(TAG, " 后摄 ... open camera  准备开始预览...");
+                //摄像头打开成功
+                mCameraOpen.setInt(AvinDefine.CameraOpen.OPEN_OVER);
+            } else {
+                mCameraOpen.setInt(AvinDefine.CameraOpen.OPEN_FAILED);
+            }
+
+        }
+        return  ret;
+    }
+     public boolean getIsBackPreView(){
+        synchronized (mSync){
+            return isBackPreView;
+        }
+    }
+
+    public void setBackPreView(boolean value){
+        synchronized (mSync){
+            isBackPreView = value;
+        }
+    }
+
+    public boolean getIsFrontPreView(){
+        synchronized (mSync){
+            return isFrontPreView;
+        }
+    }
+     private boolean isBackPreView;
+    public void showBackVideo() {
+
+        LogUtils.e(TAG, "......后 摄开始预览...");
+
+        isBackPreView = false;
+            if (null == mCameraBack) {
+                LogUtils.w(TAG, "warning, Camera object NullException.");
+                int videoSettingsType =  SPUtils.getVideoSettings(mContext);//1：单录 2:双录
+                if (videoSettingsType ==Config.VIDEO_SETTINGS_SINGLE){
+                    return;
+                }else if (videoSettingsType ==Config.VIDEO_SETTINGS_DOUBLE){
+                    LogUtils.e(TAG, "......后摄启动失败...强制重启...");
+                    DvrApplication.setInitCamera(true);
+                    rebootCamera();
+                    return;
+                }
+
+            }
+             SystemProperties.set(Stereo.CAMERA_ENABLE_DISPLAY, Stereo.CAMERA_ENABLE_DISPLAY_SHOW);
+
+        Camera.Parameters params = null;
+        try {
+            params = mCameraBack.getParameters();
+            if (PLATFORM.equals(Config.SYSTEM_PLATFORM_39) ||
+                    PLATFORM.equals(Config.SYSTEM_PLATFORM_61)) {
+                setVsdofEnable(params);
+                //默认主摄
+                SystemProperties.set(Stereo.CAMERA_DISPLAY, Stereo.CAMERA_DISPLAY_MAIN);
+            }
+            params.setFocusMode(Camera.Parameters.FOCUS_MODE_CONTINUOUS_VIDEO);
+            params.setPictureFormat(ImageFormat.JPEG);
+            params.set("first-preview-frame-black", 1);
+            setPreviewSize(BACK, params);
+//            setFrameRate(params);
+            mCameraBack.setParameters(params);
+            LogUtils.d(TAG, "####startPreview");
+            mCameraBack.setPreviewDisplay(backCView.getHolder());
+            mCameraBack.startPreview();
+            isBackPreView = true;
+
+            LogUtils.e(TAG, "......后 摄预览成功...");
+
+            mCameraOpen.setInt(Config.PREVIEW_OVER);
+
+//            LogUtils.d(TAG, "####startRecording" + Thread.currentThread().getName());
+            DvrApplication.setInitCamera(true);
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
+    }
+    private boolean rebootRecording = false;
+    /**
+     * 重启摄像头
+     */
+    public synchronized void rebootCamera(){
+        LogUtils.d(TAG, "---rebootCamera()---准备...");
+
+        if(isRecording()){
+            LogUtils.d(TAG, "---rebootCamera()---正在录制,先标识状态...");
+            //标识正在录制
+            rebootRecording = true;
+        }else {
+            rebootRecording = false;
+        }
+         close(true);
+
+        mainHandler.sendMessage(mainHandler.obtainMessage(Config.MSG_OK_SIGNAL,false));
+    }
+
+    private boolean rebootVideo = false;
+    public void rebootVideo(){
+        LogUtils.e(TAG, "......rebootVideo...");
+
+        rebootVideo = true;
+
+        new Thread(new Runnable() {
+            @Override
+            public void run() {
+
+                handleStopRecording();
+
+                try {
+                    Thread.sleep(2000);
+                } catch (InterruptedException e) {
+                    e.printStackTrace();
+                }
+                 handleStartRecording();
+            }
+        }).start();
+    }
+
+    private boolean isFrontPreView;
+     public void showFrontVideo() {
+
+        LogUtils.e(TAG, "......前 摄开始预览...");
+
+        isFrontPreView = false;
+        if (null == mCameraFront) {
+            LogUtils.e(TAG, "......warning, Camera2 object NullException.");
+
+            LogUtils.e(TAG, "......前摄启动失败...强制重启...");
+            DvrApplication.setInitCamera(true);
+            rebootCamera();
+            return;
+        }
+         SystemProperties.set(Stereo.CAMERA_ENABLE_DISPLAY, Stereo.CAMERA_ENABLE_DISPLAY_SHOW);
+
+        Camera.Parameters params = null;
+        try {
+            params = mCameraFront.getParameters();
+            params.setFocusMode(Camera.Parameters.FOCUS_MODE_CONTINUOUS_VIDEO);
+            params.setPictureFormat(ImageFormat.JPEG);
+            params.set("first-preview-frame-front", 0);
+            setPreviewSize(FRONT, params);
+//            setFrameRate(params);
+            mCameraFront.setParameters(params);
+            LogUtils.d(TAG, "2 ####startPreview");
+            mCameraFront.setPreviewDisplay(frontCView.getHolder());
+            mCameraFront.startPreview();
+            isFrontPreView = true;
+             LogUtils.e(TAG, "......前:摄预览成功...");
+            int videoSettingsType =  SPUtils.getVideoSettings(mContext);//1：单录 2:双录
+            if (videoSettingsType ==Config.VIDEO_SETTINGS_SINGLE){
+                LogUtils.e(TAG, "前: 设置cameraOpen状态");
+                mCameraOpen.setInt(Config.PREVIEW_OVER);
+            }
+//            LogUtils.d(TAG, "2 ####startRecording" + Thread.currentThread().getName());
+        } catch (Exception e) {
+            e.printStackTrace();
+            rebootCamera();
+        }
+    }
+private final int BACK = 0;
+    private final int FRONT = 1;
+    private void setPreviewSize(int type, Camera.Parameters params) throws Exception {
+        String camType = RecordData.getInstance().cameraType.getValue();
+        if (camType != null) {
+            LogUtils.d(TAG, "camType = " + camType);
+            String cam = "";
+            switch (type){
+                case BACK:
+                    cam = camType.substring(0, 1);
+                    break;
+                case FRONT:
+                    cam = camType.substring(1);
+                    break;
+            }
+            LogUtils.d(TAG, "cam = " + cam);
+            switch (cam) {
+                //NTSC
+                case "1":
+                    params.setPreviewSize(720, 240);
+                    LogUtils.d(TAG, " setPreviewSize:" + "720 * 240");
+                    PREVIEW_WIDTH = 720;
+                    PREVIEW_HEIGHT = 240;
+                    break;
+                //PAL
+                case "2":
+                    params.setPreviewSize(720, 288);
+                    LogUtils.d(TAG, " setPreviewSize:" + "720 * 288");
+                    PREVIEW_WIDTH = 720;
+                    PREVIEW_HEIGHT = 288;
+                    break;
+                    //HD
+                case "3":
+                    params.setPreviewSize(1280, 720);
+                    LogUtils.d(TAG, " setPreviewSize:" + "1280*720");
+                    PREVIEW_WIDTH = 1280;
+                    PREVIEW_HEIGHT = 720;
+                    break;
+                //FHD
+                case "4":
+                    params.setPreviewSize(1920, 1080);
+                    LogUtils.d(TAG, " setPreviewSize:" + "1920*1080");
+                    PREVIEW_WIDTH = 1920;
+                    PREVIEW_HEIGHT = 1080;
+                    break;
+                     default:
+                    params.setPreviewSize(1280, 720);
+                    LogUtils.d(TAG, " setPreviewSize:" + "1280*720");
+                    PREVIEW_WIDTH = 1280;
+                    PREVIEW_HEIGHT = 720;
+                    break;
+            }
+        }
+    }
+
+private void setVsdofEnable(Camera.Parameters params) {
+        String str = params.get(Stereo.KEY_VSDOF_MODE_SUPPORTED);
+        LogUtils.d(TAG, "setVsdofEnable  str=" + str);
+        if ("off".equals(str) || null == str) {
+            params.set(Stereo.KEY_STEREO_CAPTURE_MODE, "on");
+            params.set(Stereo.KEY_VSDOF_MODE, "off");
+        } else {
+            params.set(Stereo.KEY_IMAGE_REFOCUS_MODE, "on");
+            params.set(Stereo.KEY_VSDOF_MODE, "on");
+        }
+        params.set(Stereo.KEY_STEREO_DENOISE_MODE, "off");
+    }
+    private String readTextFile(String realPath) throws Exception {
+        File file = new File(realPath);
+        if (!file.exists()) {
+            System.out.println("File not exist!");
+            return null;
+        }
+        BufferedReader br = new BufferedReader(new InputStreamReader(new FileInputStream(realPath), "UTF-8"));
+        String temp;
+        String txt = "";
+        while ((temp = br.readLine()) != null) {
+            txt += temp;
+        }
+        br.close();
+        return txt;
+    }
+     private void writeTextFile(String tivoliMsg, String fileName) {
+        try {
+            byte[] bMsg = tivoliMsg.getBytes();
+            FileOutputStream fOut = new FileOutputStream(fileName);
+            fOut.write(bMsg);
+            fOut.getFD().sync();
+            fOut.close();
+        } catch (IOException e) {
+            //throw the exception
+        }
+    }
+     public void setMainHandler(Handler handler) {
+        mainHandler = handler;
+    }
+
+public boolean checkCamera(){
+        LogUtils.d(TAG, "检测信号...checkCamera...isInitCamera=" + DvrApplication.isInitCamera());
+        if(DvrApplication.isInitCamera()){
+            boolean isOpen = isCameraBackOpened();
+            boolean isPreView = getIsBackPreView();
+            boolean isFrontView = getIsFrontPreView();
+            boolean isFontOpen =   isCameraFrontOpened();
+
+            boolean isSignal = SPUtils.getBoolean(mContext,Config.SIGNAL);
+            int newSignal = Integer.valueOf(Utils.readTextFile(CAMERA_SIGNAL_NODE));
+            int videoSettingsType =  SPUtils.getVideoSettings(mContext);//0:单路1 1：单录2 2:双录
+            LogUtils.d(TAG, "检测信号...checkCamera...videoSettingsType=" + videoSettingsType);
+            if (videoSettingsType ==Config.VIDEO_SETTINGS_SINGLE_1){
+                LogUtils.d("checkCamera---rebootCamera0" + !isPreView);
+                LogUtils.d("checkCamera---rebootCamera0" + !isOpen);
+                        if ( !isPreView || !isOpen){
+                            rebootCamera();
+                        }
+                return true;
+            } else if (videoSettingsType ==Config.VIDEO_SETTINGS_SINGLE){
+                LogUtils.d("checkCamera---rebootCamera1" + !isFrontView );
+                LogUtils.d("checkCamera---rebootCamera1" + !isFontOpen);
+                if (!isFrontView && !isFontOpen){
+                    rebootCamera();
+                } else if (!isFrontView) {
+                    showFrontVideo();
+                }
+                return true;
+            }else if (videoSettingsType ==Config.VIDEO_SETTINGS_DOUBLE){
+                LogUtils.d(TAG, "...isOpen=" + isOpen + ",isPreView="
+                        + isPreView + ",isSignal=" + isSignal + ",,newSignal=" + newSignal);
+                if(!isOpen && !isPreView && !isSignal && (newSignal==0)){
+                    rebootCamera();
+                    return true;
+                }
+            }
+             }
+        return false;
+    }
+ /**
+     * 检测录像状态，同步关闭状态
+     *  %10 = 2
+     * @return
+     */
+    public void checkCloseRecording(){
+        String record = SystemProperties.get(Config.RECORD_ACTION);
+        LogUtils.d(TAG, "检测录像状态...checkRecording...record=" + record);
+        if(record.equals(Config.RECORD_VIDEO_MAIN_RUNNING) ||
+                record.equals(Config.RECORD_VIDEO_SUB_RUNNING) ||
+                record.equals(Config.RECORD_VIDEO_AUDIO_MAIN_RUNNING) ||
+                record.equals(Config.RECORD_VIDEO_AUDIO_SUB_RUNNING) ||
+                record.equals(Config.RECORD_VIDEO_DUAL_RUNNING) ||
+                record.equals(Config.RECORD_VIDEO_AUDIO_DUAL_RUNNING)){
+                 LogUtils.d(TAG, "...同步录像状态...关闭录像...");
+            SystemProperties.set(Config.RECORD_ACTION, Config.RECORD_VIDEO_AUDIO_DUAL_STOP);
+            try {
+                Thread.sleep(1000);
+            } catch (InterruptedException e) {
+                e.printStackTrace();
+            }
+            if(mainHandler != null){
+                mainHandler.sendMessage(mainHandler.obtainMessage(MSG_RECORD_STATUS, false));
+            }
+        }
+    }
+     private static class CameraHandler extends Handler {
+        private final WeakReference<CameraHandlerThread> mWeakThread;
+
+        public CameraHandler(CameraHandlerThread cameraHandlerThread) {
+            super(cameraHandlerThread.getLooper());
+            LogUtils.e("thread Looper:" + cameraHandlerThread.getLooper().hashCode());
+            mWeakThread = new WeakReference<>(cameraHandlerThread);
+        }
+
+ @Override
+        public void handleMessage(final Message msg) {
+            final CameraHandlerThread thread = mWeakThread.get();
+            if (thread == null) return;
+            switch (msg.what) {
+                case MSG_OPEN:
+                    thread.handleOpen();
+                    break;
+                case MSG_CLOSE:
+                    thread.handleClose();
+                    break;
+                case MSG_PREVIEW_STOP:
+                    thread.handleStopPreview();
+                      break;
+                case MSG_CAPTURE_STILL:
+                    thread.handleCaptureStill((String) msg.obj, msg.arg1);
+                    break;
+                case MSG_CAPTURE_START:
+                    thread.handleStartRecording();
+                    break;
+                case MSG_CAPTURE_STOP:
+                    thread.handleStopRecording();
+                    break;
+                default:
+//                throw new RuntimeException("unsupported message:what=" + msg.what);
+            }
+        }
+    }
+    public void setVideoSettings(int videoSettingsType){
+            if (videoSettingsType ==Config.VIDEO_SETTINGS_SINGLE_1){
+                LogUtils.d("setVideoSettings 视频设置切换为单录1，开始关闭前摄");
+                closeFontCamera();
+       } else if (videoSettingsType ==Config.VIDEO_SETTINGS_SINGLE) //单录1
+        {
+            LogUtils.d("setVideoSettings 视频设置切换为单录2，开始关闭后摄");
+            closeBackCamera();
+        }else if (videoSettingsType ==Config.VIDEO_SETTINGS_DOUBLE) //双录
+        {
+            LogUtils.d("setVideoSettings 视频设置切换为双录");
+                open();
+        }
+        ThreadpoolUtil.execute(new Runnable() {
+                @Override
+                public void run() {
+                    LogUtils.d("setVideoSettings 开始执行录像状态写入操作、。。。。。");
+                    sendRecordValue();
+                }
+            });
+
+    }
+     public void closeBackCamera(){
+        if (null != mCameraBack) {
+            LogUtils.d(TAG, "---close Camera----开始释放 后 camera资源----------");
+            if (isBackPreView) {
+                mCameraBack.stopPreview();
+                mCameraBack.setPreviewCallback(null);
+                mCameraBack.setErrorCallback(null);
+                isBackPreView = false;
+                LogUtils.d(TAG, "---close Camera----停止 后 camera预览----------");
+            }
+            mCameraBack.release();
+            mCameraBack = null;
+            lastSignal = newSignal = 0;
+            noSignalCount = 0;
+
+            LogUtils.d(TAG, "---close Camera----后camera---close over.------");
+
+        }
+    }
+    private void closeFontCamera(){
+        if (null != mCameraFront) {
+            LogUtils.d(TAG, "---close Camera----开始释放 前 camera资源----------");
+            if (isFrontPreView) {
+                mCameraFront.stopPreview();
+                mCameraFront.setPreviewCallback(null);
+                mCameraFront.setErrorCallback(null);
+                isFrontPreView = false;
+                LogUtils.d(TAG, "---close Camera----停止 前 camera预览----------");
+            }
+
+            mCameraFront.release();
+            mCameraFront = null;
+            lastSignal = newSignal = 0;
+            noSignalCount = 0;
+            LogUtils.d(TAG, "---close Camera----前camera---close over.------");
+
+        }
+    }
+}
+
