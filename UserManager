@@ -1,0 +1,85 @@
+public class UserManager extends BaseDao<UserDao> {
+    public UserManager(Context context) {
+        super(context);
+    }
+
+    /**
+     * 通过ID查询对象
+     * @return
+     */
+    public UserDao loadById(long id){
+         return daoSession.getUserDaoDao().load(id);
+    }
+
+    public List<UserDao>   loadAll(){
+        return  queryAll(UserDao.class);
+    }
+
+    /**
+     * 传入的对象在数据库中，有则更新无则插入
+     * @param userDao
+     */
+    public void  insertUser(UserDao userDao){
+        daoSession.getUserDaoDao().insertOrReplace(userDao);
+    }
+ /**
+     * 获取某个对象的主键ID
+     * @param userDao
+     * @return
+     */
+    public long getID(UserDao userDao){
+
+        return daoSession.getUserDaoDao().getKey(userDao);
+    }
+
+    /**
+     * 通过名字获取Customer对象
+     * @return
+     */
+    public List<UserDao> getUserDaoByName(String key){
+        QueryBuilder queryBuilder =  daoSession.getUserDaoDao().queryBuilder();
+        queryBuilder.where(UserDaoDao.Properties.Name.eq(key));
+        int size = queryBuilder.list().size();
+        if (size > 0){
+            return queryBuilder.list();
+        }else{
+            return null;
+        }
+    }
+ /**
+     * 通过名字获取Customer对象
+     * @return
+     */
+    public List<Long> getIdByName(String key){
+        List<UserDao> students = getUserDaoByName(key);
+        List<Long> ids = new ArrayList<Long>();
+        int size = students.size();
+        if (size > 0){
+            for (int i = 0;i < size;i++){
+                ids.add(students.get(i).getId());
+            }
+            return ids;
+        }else{
+            return null;
+        }
+    }
+  /***************************数据库删除*************************/
+
+    /**
+     * 根据ID进行数据库的删除操作
+     * @param id
+     */
+    public void deleteById(long id){
+        daoSession.getUserDaoDao().deleteByKey(id);
+    }
+
+    /**
+     * 根据ID同步删除数据库操作
+     * @param ids
+     */
+    public void deleteByIds(List<Long> ids) {
+
+        daoSession.getUserDaoDao().deleteByKeyInTx(ids);
+    }
+
+}
